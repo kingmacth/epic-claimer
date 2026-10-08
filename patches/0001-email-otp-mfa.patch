@@ -1,0 +1,570 @@
+diff --git a/app/services/epic_email_otp_service.py b/app/services/epic_email_otp_service.py
+new file mode 100644
+index 0000000..e58bbbd
+--- /dev/null
++++ b/app/services/epic_email_otp_service.py
+@@ -0,0 +1,353 @@
++# -*- coding: utf-8 -*-
++"""从邮箱中取出 Epic Games 登录验证码（邮箱 2FA 自动化的取码环节）。
++
++背景
++----
++Epic 登录的第二因子可以配成「邮箱验证码」。本项目原生只支持验证器 App
++（`epic_totp_service.py` 里的 pyotp）。本模块补上另一条来源：连 IMAP 读最新
++一封来自 Epic 的邮件，抽出 6 位验证码，交给上层填写。
++
++本机实测到的网络约束（重要）
++---------------------------
++1. 容器出口 **993 端口被封**（imap.163.com / imap.126.com / imap.qq.com 的 993
++   全部超时），但 **143 端口正常**。因此这里默认走 143 + STARTTLS，而不是
++   ``IMAP4_SSL``。
++2. **Gmail / Google 整体不可达**（imap.gmail.com、googleapis.com 均超时）。
++   所以 Epic 账号邮箱若是 gmail，务必在 Gmail 里配置「自动转发」到 163/126/QQ，
++   再让脚本读国内邮箱。
++3. 网易 163/126 对部分非主流客户端会返回 ``Unsafe Login``，登录成功后补发一条
++   IMAP ``ID`` 命令可规避（已实现，失败不阻断）。
++
++安全
++----
++只记录「是否取到码 / 邮件时间 / 邮件标题」，**不记录验证码本身**。
++"""
++from __future__ import annotations
++
++import asyncio
++import email
++import email.utils
++import imaplib
++import os
++import re
++import ssl
++import time
++from contextlib import suppress
++from email.header import decode_header, make_header
++
++from loguru import logger
++
++# 网易系邮箱对未声明身份的客户端会判定为不安全登录，登录后必须补发 ID 命令，
++# 否则 SELECT 会返回 "NO [EXAMINE Unsafe Login. Please contact kefu@188.com for help]"。
++_IMAP_ID_ARGS = (
++    '("name" "epic-claimer" "version" "1.0" "vendor" "workbuddy" '
++    '"support-email" "noreply@localhost")'
++)
++
++# imaplib 内置命令表里没有 ID，不注册的话 _simple_command 会直接抛 KeyError: 'ID'，
++# 命令根本发不出去（这是踩过的坑）。
++if "ID" not in imaplib.Commands:
++    imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
++
++_HINT_RE = re.compile(
++    r"verification code|security code|login code|one[- ]?time code|"
++    r"digit code|code to verify|verify your|"
++    r"验证码|安全代码|登录代码|动态码|一次性",
++    re.IGNORECASE,
++)
++
++# 6 位连续数字
++_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
++# 6 个数字被空格 / &nbsp; / 标签拆开的情况（HTML 邮件常见）
++_SPLIT_CODE_RE = re.compile(r"(?<!\d)(?:\d[\s\u00a0\u200b]*){6}(?!\d)")
++_HTML_TAG_RE = re.compile(r"<[^>]+>")
++
++# HTML 里的样式块/注释/内联 style 会带入大量 6 位色值（如 #595959），
++# 污染"全文唯一 6 位数字"的兜底判断（实测 Epic 邮件因此抽不到码）。
++_STYLE_BLOCK_RE = re.compile(r"<(style|script)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
++_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
++_STYLE_ATTR_RE = re.compile(r"""\sstyle\s*=\s*("[^"]*"|'[^']*')""", re.IGNORECASE)
++# 兜底保险：剥掉 #RRGGBB 形式的色值
++_HEX_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}\b")
++
++# 最近一次成功取到的邮件时间，用于重试时优先等待「更新的」邮件。
++_last_used_received_at: float | None = None
++
++
++# --------------------------------------------------------------------------- #
++# 配置
++# --------------------------------------------------------------------------- #
++def _env(name: str, default: str = "") -> str:
++    value = os.getenv(name)
++    return default if value is None else value.strip()
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = _env(name)
++    if not raw:
++        return default
++    with suppress(ValueError):
++        return int(raw)
++    return default
++
++
++def email_otp_enabled() -> bool:
++    """是否配置了邮箱取码（需要 IMAP 账号 + 授权码）。"""
++    return bool(_env("EPIC_IMAP_USER") and _env("EPIC_IMAP_PASS"))
++
++
++def last_used_received_at() -> float | None:
++    return _last_used_received_at
++
++
++# --------------------------------------------------------------------------- #
++# IMAP
++# --------------------------------------------------------------------------- #
++def _connect() -> imaplib.IMAP4:
++    host = _env("EPIC_IMAP_HOST", "imap.163.com")
++    port = _env_int("EPIC_IMAP_PORT", 143)
++    user = _env("EPIC_IMAP_USER")
++    password = _env("EPIC_IMAP_PASS")
++    context = ssl.create_default_context()
++
++    if port == 993:
++        conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, ssl_context=context)
++    else:
++        conn = imaplib.IMAP4(host, port)
++        conn.starttls(ssl_context=context)
++
++    conn.login(user, password)
++    _send_imap_id(conn)
++    return conn
++
++
++def _send_imap_id(conn: imaplib.IMAP4) -> None:
++    """网易系邮箱要求登录后声明客户端身份，否则 SELECT 会被判为 Unsafe Login。"""
++    try:
++        typ, dat = conn._simple_command("ID", _IMAP_ID_ARGS)  # noqa: SLF001
++    except Exception as err:  # noqa: BLE001
++        logger.warning(
++            "发送 IMAP ID 命令失败，后续 SELECT 可能被拒 | error_type={} | detail={}",
++            type(err).__name__,
++            err,
++        )
++        return
++
++    if typ != "OK":
++        logger.warning("IMAP ID 命令未成功 | response={}", dat)
++        return
++
++    with suppress(Exception):
++        conn._untagged_response(typ, dat, "ID")  # noqa: SLF001
++
++
++# --------------------------------------------------------------------------- #
++# 邮件解析
++# --------------------------------------------------------------------------- #
++def _decode_header_value(value: str | None) -> str:
++    """解码邮件头。
++
++    注意：``decode_header`` 对未编码的 ASCII 头返回 str，对 MIME 编码头返回
++    bytes。必须用 ``make_header`` 拼回完整字符串，否则 MIME 编码的发件人/标题
++    会被解成空串（踩过这个坑）。
++    """
++    if not value:
++        return ""
++    with suppress(Exception):
++        return str(make_header(decode_header(value)))
++    return value
++
++
++def _message_text(message: email.message.Message) -> str:
++    chunks: list[str] = []
++
++    def _collect(part: email.message.Message) -> None:
++        if part.get_content_maintype() == "multipart":
++            return
++        if part.get_content_type() not in ("text/plain", "text/html"):
++            return
++        payload = part.get_payload(decode=True)
++        if not payload:
++            return
++        charset = part.get_content_charset() or "utf-8"
++        with suppress(Exception):
++            chunks.append(payload.decode(charset, errors="replace"))
++
++    if message.is_multipart():
++        for part in message.walk():
++            _collect(part)
++    else:
++        _collect(message)
++
++    raw = "\n".join(chunks)
++    # HTML 转纯文本前先清掉样式块、注释、内联 style —— 否则 #RRGGBB 之类
++    # 的 6 位色值会混进"数字池"，导致验证码被误判为"不唯一"。
++    text = _COMMENT_RE.sub(" ", raw)
++    text = _STYLE_BLOCK_RE.sub(" ", text)
++    text = _STYLE_ATTR_RE.sub(" ", text)
++    text = _HTML_TAG_RE.sub(" ", text)
++    text = _HEX_COLOR_RE.sub(" ", text)
++    text = (
++        text.replace("&nbsp;", " ")
++        .replace("&amp;", "&")
++        .replace("&#39;", "'")
++        .replace("&quot;", '"')
++    )
++    return f"{_decode_header_value(message.get('Subject'))}\n{text}"
++
++
++def _find_code(text: str) -> str | None:
++    """从邮件正文里找 6 位验证码。优先取提示词附近的数字。"""
++    if not text:
++        return None
++
++    # 1) 在"验证码"类提示词附近找
++    for hint in _HINT_RE.finditer(text):
++        window = text[hint.end() : hint.end() + 200]
++        match = _CODE_RE.search(window)
++        if match:
++            return match.group(1)
++        split = _SPLIT_CODE_RE.search(window)
++        if split:
++            return re.sub(r"\D", "", split.group(0))
++
++    for hint in _HINT_RE.finditer(text):
++        window = text[max(hint.start() - 200, 0) : hint.start()]
++        match = _CODE_RE.search(window)
++        if match:
++            return match.group(1)
++
++    # 1.5) 独立成行的 6 位数字（验证码通常单独占一行）
++    standalone = {
++        m.group(1) for m in re.finditer(r"(?m)^[^\S\n]*(\d{6})[^\S\n]*$", text)
++    }
++    if len(standalone) == 1:
++        return standalone.pop()
++
++    # 2) 兜底：全文唯一的 6 位数字
++    candidates = {m.group(1) for m in _CODE_RE.finditer(text)}
++    if len(candidates) == 1:
++        return candidates.pop()
++
++    # 3) 再兜底：被拆开的 6 位数字
++    split_candidates = {re.sub(r"\D", "", m.group(0)) for m in _SPLIT_CODE_RE.finditer(text)}
++    if len(split_candidates) == 1:
++        return split_candidates.pop()
++
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# 取码
++# --------------------------------------------------------------------------- #
++def _poll_once(lookback_seconds: int) -> tuple[str, float, str] | None:
++    """返回 (验证码, 邮件时间戳, 标题)；找不到返回 None。"""
++    folder = _env("EPIC_IMAP_FOLDER", "INBOX")
++    sender_hint = _env("EPIC_OTP_SENDER_HINT", "epicgames").lower()
++    threshold = time.time() - lookback_seconds
++
++    conn = _connect()
++    try:
++        conn.select(folder, readonly=True)
++        since = time.strftime("%d-%b-%Y", time.gmtime(threshold - 86400))
++        typ, data = conn.uid("SEARCH", None, f"(SINCE {since})")
++        if typ != "OK" or not data or not data[0]:
++            return None
++
++        uids = data[0].split()[-30:]
++        for uid in reversed(uids):
++            typ, fetched = conn.uid("FETCH", uid, "(RFC822)")
++            if typ != "OK" or not fetched:
++                continue
++            raw = next(
++                (item[1] for item in fetched if isinstance(item, tuple) and len(item) > 1),
++                None,
++            )
++            if not raw:
++                continue
++
++            message = email.message_from_bytes(raw)
++            sender = (message.get("From") or "").lower()
++            if sender_hint and sender_hint not in sender:
++                continue
++
++            received = time.time()
++            with suppress(Exception):
++                received = email.utils.parsedate_to_datetime(message.get("Date")).timestamp()
++            if received < threshold:
++                continue
++
++            code = _find_code(_message_text(message))
++            if code:
++                return code, received, _decode_header_value(message.get("Subject"))
++
++        return None
++    finally:
++        with suppress(Exception):
++            conn.logout()
++
++
++async def wait_for_login_code(*, prefer_newer_than: float | None = None) -> str | None:
++    """轮询邮箱直到拿到 Epic 登录验证码。
++
++    prefer_newer_than: 若给出，则优先等待比该时间更新的邮件（用于重试场景），
++    但到达超时时间仍未等到新邮件时，会退回使用当前最新的那封。
++    """
++    if not email_otp_enabled():
++        return None
++
++    global _last_used_received_at
++
++    wait_seconds = _env_int("EPIC_OTP_WAIT_SECONDS", 180)
++    lookback_seconds = _env_int("EPIC_OTP_LOOKBACK_SECONDS", 600)
++    deadline = time.monotonic() + wait_seconds
++    fallback: tuple[str, float, str] | None = None
++    attempt = 0
++
++    while True:
++        attempt += 1
++        try:
++            found = await asyncio.to_thread(_poll_once, lookback_seconds)
++        except Exception as err:  # noqa: BLE001
++            logger.warning(
++                "读取邮箱验证码失败（第 {} 次）| error_type={} | detail={}",
++                attempt,
++                type(err).__name__,
++                err,
++            )
++            found = None
++
++        if found:
++            code, received, subject = found
++            if prefer_newer_than is None or received > prefer_newer_than + 1:
++                logger.info(
++                    "已从邮箱取得 Epic 登录验证码 | 邮件时间={} | 标题='{}' | 码长={}",
++                    time.strftime("%H:%M:%S", time.localtime(received)),
++                    subject[:60],
++                    len(code),
++                )
++                _last_used_received_at = received
++                return code
++            if fallback is None:
++                fallback = found
++                logger.info(
++                    "邮箱暂无更新的验证码邮件，继续等待新邮件 | 当前最新邮件时间={}",
++                    time.strftime("%H:%M:%S", time.localtime(received)),
++                )
++        elif attempt == 1:
++            logger.info("邮箱里还没有 Epic 验证码邮件，开始轮询等待（最多 {} 秒）", wait_seconds)
++
++        if time.monotonic() >= deadline:
++            if fallback is not None:
++                code, received, subject = fallback
++                logger.warning(
++                    "超时仍未等到新邮件，退回使用最新一封 | 邮件时间={} | 标题='{}'",
++                    time.strftime("%H:%M:%S", time.localtime(received)),
++                    subject[:60],
++                )
++                _last_used_received_at = received
++                return code
++            logger.error("等待 {} 秒仍未在邮箱中找到 Epic 登录验证码邮件", wait_seconds)
++            return None
++
++        await asyncio.sleep(6)
+diff --git a/app/services/epic_totp_service.py b/app/services/epic_totp_service.py
+index 03d5153..8185832 100644
+--- a/app/services/epic_totp_service.py
++++ b/app/services/epic_totp_service.py
+@@ -10,6 +10,12 @@ import pyotp
+ from loguru import logger
+ from playwright.async_api import Locator, Page, expect
+ 
++from services.epic_email_otp_service import (
++    email_otp_enabled,
++    last_used_received_at,
++    wait_for_login_code,
++)
++
+ TOTP_INPUT_SELECTORS = (
+     "input[autocomplete='one-time-code']",
+     "input[name='code']",
+@@ -27,13 +33,26 @@ def _totp_secret_value() -> str | None:
+ 
+ 
+ def totp_login_enabled() -> bool:
+-    return _totp_secret_value() is not None
++    """是否配置了任意一种可自动完成的 2FA 取码来源。
++
++    优先级：``EPIC_TOTP_SECRET``（验证器 App）> 邮箱取码（EPIC_IMAP_*）。
++    任一可用即视为「2FA 可自动完成」，上层据此决定是否继续登录流程。
++    """
++    if _totp_secret_value() is not None:
++        return True
++    return email_otp_enabled()
++
++
++async def _email_login_code(page: Page) -> str | None:
++    """从邮箱读取 Epic 登录验证码（邮箱 2FA 场景）。"""
++    logger.info("未配置 EPIC_TOTP_SECRET，改用「邮箱取码」获取 Epic 登录验证码")
++    return await wait_for_login_code(prefer_newer_than=last_used_received_at())
+ 
+ 
+ async def _current_totp_code(page: Page, *, force_next_window: bool = False) -> str | None:
+     secret = _totp_secret_value()
+     if not secret:
+-        return None
++        return await _email_login_code(page)
+ 
+     try:
+         totp = pyotp.TOTP(secret)
+diff --git a/tools/test_email_otp.py b/tools/test_email_otp.py
+new file mode 100644
+index 0000000..72c837e
+--- /dev/null
++++ b/tools/test_email_otp.py
+@@ -0,0 +1,159 @@
++# -*- coding: utf-8 -*-
++"""邮箱取码自测脚本。
++
++在真正跑登录流程之前，先用它单独验证三件事：
++  1) 能不能连上邮箱的 IMAP；
++  2) 收件箱里到底有没有 Epic 的验证码邮件（即 Gmail 自动转发是否生效）；
++  3) 验证码能不能被正确抽出来。
++
++用法（在 epic-claimer 目录下执行）：
++
++    docker compose run --rm --no-deps claimer \
++        /app/.venv/bin/python /app/tools/test_email_otp.py
++
++只想看最近邮件、不做取码：
++
++    docker compose run --rm --no-deps claimer \
++        /app/.venv/bin/python /app/tools/test_email_otp.py --list 15
++"""
++from __future__ import annotations
++
++import argparse
++import email
++import email.utils
++import sys
++import time
++from contextlib import suppress
++
++sys.path.insert(0, "/app/app")
++sys.path.insert(0, "/app")
++
++from services.epic_email_otp_service import (  # noqa: E402
++    _connect,
++    _decode_header_value,
++    _env,
++    _env_int,
++    _find_code,
++    _message_text,
++    email_otp_enabled,
++)
++
++
++def _mask(value: str) -> str:
++    if not value:
++        return "(空)"
++    if "@" in value:
++        name, _, domain = value.partition("@")
++        return f"{name[:2]}***@{domain}"
++    return f"长度{len(value)}"
++
++
++def print_config() -> bool:
++    print("=" * 62)
++    print("邮箱取码配置")
++    print("=" * 62)
++    host = _env("EPIC_IMAP_HOST", "imap.163.com")
++    port = _env_int("EPIC_IMAP_PORT", 143)
++    user = _env("EPIC_IMAP_USER")
++    password = _env("EPIC_IMAP_PASS")
++    print(f"  EPIC_IMAP_HOST          = {host}")
++    print(f"  EPIC_IMAP_PORT          = {port}")
++    print(f"  EPIC_IMAP_USER          = {_mask(user)}")
++    print(f"  EPIC_IMAP_PASS          = {_mask(password)}")
++    print(f"  EPIC_IMAP_FOLDER        = {_env('EPIC_IMAP_FOLDER', 'INBOX')}")
++    print(f"  EPIC_OTP_SENDER_HINT    = {_env('EPIC_OTP_SENDER_HINT', 'epicgames')}")
++    print(f"  EPIC_OTP_WAIT_SECONDS   = {_env_int('EPIC_OTP_WAIT_SECONDS', 180)}")
++    print(f"  EPIC_OTP_LOOKBACK_SECONDS = {_env_int('EPIC_OTP_LOOKBACK_SECONDS', 600)}")
++
++    if not email_otp_enabled():
++        print("\n[结果] 未配置 IMAP 账号/授权码，无法测试。请填写 .env 里的")
++        print("       EPIC_IMAP_USER 和 EPIC_IMAP_PASS 后重试。")
++        return False
++    return True
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--list", type=int, default=12, help="列出最近 N 封邮件")
++    args = parser.parse_args()
++
++    if not print_config():
++        return 2
++
++    print("\n" + "=" * 62)
++    print("连接 IMAP")
++    print("=" * 62)
++    started = time.time()
++    try:
++        conn = _connect()
++    except Exception as err:  # noqa: BLE001
++        print(f"[失败] 连接/登录失败：{type(err).__name__}: {err}")
++        print("       常见原因：授权码填错（要用「授权码」不是登录密码）、")
++        print("       或邮箱未开启 IMAP 服务。")
++        return 3
++    print(f"[成功] 已登录，耗时 {time.time() - started:.1f}s")
++
++    folder = _env("EPIC_IMAP_FOLDER", "INBOX")
++    hint = _env("EPIC_OTP_SENDER_HINT", "epicgames").lower()
++
++    try:
++        typ, data = conn.select(folder, readonly=True)
++        print(f"[{'成功' if typ == 'OK' else '失败'}] 打开文件夹 {folder}: {typ}")
++        since = time.strftime("%d-%b-%Y", time.gmtime(time.time() - 30 * 86400))
++        typ, data = conn.uid("SEARCH", None, f"(SINCE {since})")
++        uids = data[0].split() if (typ == "OK" and data and data[0]) else []
++        print(f"[信息] 近 30 天共 {len(uids)} 封邮件，将检查最近 {args.list} 封")
++
++        epic_hits: list[tuple[float, str, str, str | None]] = []
++        print("\n" + "=" * 62)
++        print("最近邮件")
++        print("=" * 62)
++        for uid in reversed(uids[-args.list :]):
++            typ, fetched = conn.uid("FETCH", uid, "(RFC822)")
++            if typ != "OK" or not fetched:
++                continue
++            raw = next(
++                (i[1] for i in fetched if isinstance(i, tuple) and len(i) > 1), None
++            )
++            if not raw:
++                continue
++            msg = email.message_from_bytes(raw)
++            sender = _decode_header_value(msg.get("From"))
++            subject = _decode_header_value(msg.get("Subject"))
++            received = time.time()
++            with suppress(Exception):
++                received = email.utils.parsedate_to_datetime(msg.get("Date")).timestamp()
++            stamp = time.strftime("%m-%d %H:%M", time.localtime(received))
++            is_epic = hint in sender.lower()
++            mark = " ★Epic" if is_epic else ""
++            print(f"  {stamp} | {sender[:42]:42} | {subject[:44]}{mark}")
++            if is_epic:
++                epic_hits.append((received, sender, subject, _find_code(_message_text(msg))))
++
++        print("\n" + "=" * 62)
++        print("取码结果")
++        print("=" * 62)
++        if not epic_hits:
++            print("[未找到] 最近邮件里没有发件人含 "
++                  f"'{hint}' 的邮件。")
++            print("         → 检查 Gmail 的「转发」过滤器是否已生效并已确认目标地址。")
++            return 4
++
++        newest = max(epic_hits, key=lambda item: item[0])
++        stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(newest[0]))
++        print(f"  最新 Epic 邮件：{stamp} | {newest[2][:60]}")
++        if newest[3]:
++            code = newest[3]
++            print(f"  [成功] 抽出验证码：{'*' * (len(code) - 2)}{code[-2:]}（长度 {len(code)}）")
++            print(f"  验证码整体长度应为 6；若不符请把邮件原文发我，我调整解析规则。")
++            return 0
++        print("  [失败] 拿到了 Epic 邮件，但没抽出验证码。")
++        print("         请把该邮件原文（含正文）发我，我按真实格式调解析规则。")
++        return 5
++    finally:
++        with suppress(Exception):
++            conn.logout()
++
++
++if __name__ == "__main__":
++    sys.exit(main())

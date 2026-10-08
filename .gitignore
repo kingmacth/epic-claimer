@@ -1,0 +1,22 @@
+# ===== 密钥与账号：绝对不要提交 =====
+# .env 里含 Epic 密码、邮箱授权码、大模型 API Key
+.env
+.env.*
+# 但配置模板要提交
+!.env.example
+# 各类备份文件同样含密钥
+*.bak
+
+# ===== 运行数据 =====
+# 浏览器 profile（含登录 cookie）、运行日志、登录页截图、录屏
+volumes/
+
+# ===== 上游源码副本 =====
+# repo/ 由 setup 脚本从上游 clone 后按 patches/ 打补丁生成，不入库
+repo/
+
+# ===== 杂项 =====
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db

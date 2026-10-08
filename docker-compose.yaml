@@ -1,0 +1,43 @@
+name: epic-freebies-helper
+
+# Epic 每周免费游戏 自动领取
+#
+# 说明：上游 ghcr.io/ronchy2000/epic-freebies-helper 是私有仓库，外部拉不到，
+#       所以这里改为从 repo/docker/Dockerfile 本地构建。
+#
+# 常用命令：
+#   首次构建并启动：docker compose up -d --build
+#   看日志：        docker compose logs -f --tail=200
+#   停止：          docker compose down
+#
+# 注意：容器每次启动都会立刻执行一次领取任务，且 Epic 有 24 小时限流，
+#       不要频繁重启容器，否则会白白消耗限流额度。
+
+services:
+  claimer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: epic-freebies-helper:local
+    container_name: epic-freebies-helper
+    restart: unless-stopped
+
+    # 所有账号、密钥都放在同目录的 .env 里，不要提交到任何仓库
+    env_file:
+      - .env
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    volumes:
+      # 日志、截图、浏览器 profile 落在这里，宿主机可直接读取
+      - ./volumes:/app/app/volumes
+
+    entrypoint: ["/usr/bin/tini", "--"]
+    command: >
+      xvfb-run --auto-servernum --server-num=1
+      --server-args='-screen 0, 1920x1080x24'
+      uv run app/deploy.py
+
+    mem_limit: 4g
+    shm_size: "2gb"

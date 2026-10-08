@@ -1,0 +1,121 @@
+diff --git a/app/services/browser_context.py b/app/services/browser_context.py
+index 8648e53..4a05882 100644
+--- a/app/services/browser_context.py
++++ b/app/services/browser_context.py
+@@ -88,6 +88,13 @@ def _browser_proxy_options() -> dict[str, str] | None:
+ def _camoufox_launch_options(headless: bool | str, proxy: dict[str, str] | None) -> dict:
+     from browserforge.fingerprints import Screen
+ 
++    # --- 本地补丁（epic-claimer）---
++    # camoufox 默认会下载 uBlock Origin 插件，但 addons.mozilla.org 在部分网络下返回 451，
++    # 下载失败会留下一个空目录；下次启动时 camoufox 会因 manifest.json 缺失直接抛
++    # InvalidAddonPath，且该异常不在 _is_camoufox_bootstrap_error 的降级白名单里，
++    # 会导致整个任务崩溃。这里显式排除默认插件，彻底绕开这个问题。
++    from camoufox import DefaultAddons
++
+     screen = Screen(max_width=1920, max_height=1080, min_height=1080, min_width=1920)
+     firefox_user_prefs = {"network.dns.disableIPv6": True, "network.trr.mode": 5}
+     if proxy is None:
+@@ -102,6 +109,7 @@ def _camoufox_launch_options(headless: bool | str, proxy: dict[str, str] | None)
+         "firefox_user_prefs": firefox_user_prefs,
+         "humanize": 0.2,
+         "headless": headless,
++        "exclude_addons": [DefaultAddons.UBO],
+     }
+     if proxy is not None:
+         options["proxy"] = proxy
+diff --git a/app/services/epic_authorization_service.py b/app/services/epic_authorization_service.py
+index 373c581..ea41356 100644
+--- a/app/services/epic_authorization_service.py
++++ b/app/services/epic_authorization_service.py
+@@ -10,6 +10,7 @@ import json
+ import os
+ import time
+ from contextlib import suppress
++from urllib.parse import quote
+ 
+ os.environ.setdefault("MPLBACKEND", "Agg")
+ 
+@@ -27,6 +28,12 @@ from settings import SCREENSHOTS_DIR, settings
+ URL_CLAIM = "https://store.epicgames.com/en-US/free-games"
+ URL_ORDER_HISTORY = "https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory"
+ 
++# --- 本地补丁（epic-claimer）---
++# 上游把「点击登录按钮」「等待密码框出现」两处硬编码为 10 秒。
++# 在国内网络访问 Epic 页面较慢时，10 秒经常不够，导致登录必然失败。
++# 这里改成可通过环境变量 EPIC_ELEMENT_TIMEOUT_MS 配置，默认仍为 10 秒，行为不变。
++ELEMENT_TIMEOUT_MS = int(os.getenv("EPIC_ELEMENT_TIMEOUT_MS", "10000"))
++
+ 
+ class EpicAuthenticationFatalError(RuntimeError):
+     pass
+@@ -602,7 +609,7 @@ class EpicAuthorization:
+             return
+ 
+         try:
+-            await self.page.locator("#sign-in").click(timeout=10000, no_wait_after=True)
++            await self.page.locator("#sign-in").click(timeout=ELEMENT_TIMEOUT_MS, no_wait_after=True)
+         except PlaywrightTimeoutError:
+             if await self._has_visible_hcaptcha():
+                 logger.warning(
+@@ -651,6 +658,7 @@ class EpicAuthorization:
+         deadline = time.monotonic() + timeout_seconds
+         account_probe_at = time.monotonic() + 8
+         account_probe_attempted = False
++        false_streak = 0
+ 
+         while time.monotonic() < deadline:
+             if self._needs_privacy_policy_correction():
+@@ -670,9 +678,32 @@ class EpicAuthorization:
+             if status == "true":
+                 return
+             if status == "false":
++                # 登录成功 ≠ store 会话就绪：store 域的会话要靠 SSO 交换端点
++                # （/id/api/redirect）种 cookie，页面加载太早会读到 isloggedin=false。
++                # 先走一次 SSO 交换，再刷新重读，而不是立刻判死。
++                false_streak += 1
++                if false_streak == 1:
++                    logger.warning(
++                        "Epic store reports isloggedin=false; completing SSO exchange "
++                        "via /id/api/redirect | current_url='{}'",
++                        self.page.url,
++                    )
++                    with suppress(Exception):
++                        await self.page.goto(
++                            "https://www.epicgames.com/id/api/redirect?redirectUrl="
++                            + quote(URL_CLAIM, safe=""),
++                            wait_until="domcontentloaded",
++                            timeout=30000,
++                        )
++                    await self._goto_claim_page()
++                    continue
++                if false_streak == 2:
++                    with suppress(Exception):
++                        await self.page.reload(wait_until="domcontentloaded", timeout=30000)
++                    continue
+                 raise RuntimeError(
+-                    "Epic store still reports isloggedin=false after authentication. "
+-                    f"current_url={self.page.url}"
++                    "Epic store still reports isloggedin=false after authentication "
++                    f"(including SSO exchange and reload attempts). current_url={self.page.url}"
+                 )
+ 
+             if not account_probe_attempted and time.monotonic() >= account_probe_at:
+@@ -723,7 +754,7 @@ class EpicAuthorization:
+ 
+             # 3. 输入密码
+             password_input = self.page.locator("#password")
+-            await expect(password_input).to_be_visible(timeout=10000)
++            await expect(password_input).to_be_visible(timeout=ELEMENT_TIMEOUT_MS)
+             await password_input.fill(settings.EPIC_PASSWORD.get_secret_value())
+ 
+             # 4. 点击登录按钮，触发人机挑战值守监听器
+@@ -788,7 +819,7 @@ class EpicAuthorization:
+             await asyncio.wait_for(self._handle_right_account_validation(), timeout=60)
+             logger.success("Right account validation success")
+             await self._goto_claim_page()
+-            await self._ensure_store_session_ready()
++            await self._ensure_store_session_ready(timeout_seconds=90)
+             logger.success("Epic store session verification success")
+             return True
+         except Exception as err:
