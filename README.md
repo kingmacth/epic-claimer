@@ -338,6 +338,13 @@ playwright 1.53.0，运行时报 `Executable doesn't exist at /ms-playwright/fir
 而是先走一次 SSO 交换 → 回商店页重读；仍失败则 reload 再重读；两次都不行才抛错。
 同时把该函数的超时从 45 秒放宽到 90 秒。实测 SSO 一次即成功。
 
+后补：还有一种更隐蔽的情况——`//egs-navigation` 一直**超时读不到**（既不是 true 也不是 false）。
+旧逻辑只在读到 `false` 时才走 SSO 交换，这条路会直接跳过交换、仅凭账号域（订单历史）探测
+就宣布"会话就绪"，结果 store 域 cookie 从未种下，采集阶段报
+`context cookies is not available`。现已改为：**只要商店会话没有被确认为 `true`，
+就补一次 SSO 交换**；采集阶段的商店会话判定同样加了"先换会话再重试"的兜底，
+不再把首次读到的 `isloggedin=false` 直接判死。
+
 ### 补丁 7：邮箱取码抽不到码（关键 bug）
 `app/services/epic_email_otp_service.py`
 
@@ -372,11 +379,72 @@ playwright 1.53.0，运行时报 `Executable doesn't exist at /ms-playwright/fir
 的最新 `GeoLite2-City.mmdb`（约 48 MB，用 `releases/latest/download` 会自动跳转最新版），
 并用 `maxminddb.open_database()` 当场校验。构建内下载耗时约 106 秒。
 
+### 补丁 9：领取结果以「订单历史」为准复核（关键修复）
+`app/services/epic_games_service.py`
+
+**现象**：日志明明打印 `🎉 Instant checkout confirmed claim state`，Epic 邮箱里却没有该游戏的
+领取回执 —— 也就是说**看起来领到了，实际没有下单**。本期 TerraScape 就是这样被漏掉的：
+日志报成功，但既无订单也无回执（对比同期 Out of Sight 有正式回执）。
+
+**原因**：上游判断"是否领取成功"靠的是页面 UI 标记（商品页购买按钮变成 `IN LIBRARY`、
+结算区出现确认文案）。当结算 iframe（`structural-checkout-frame`）没有正常收尾时，
+这些标记会**误报成功**。
+
+**修法**：新增 `_verify_weekly_claims()`，在领取动作跑完之后**回到 Epic 订单历史**
+（`/account/v2/payment/ajaxGetOrderHistory`，与"此前已拥有"判定同一数据源，即服务端真实数据）
+逐款复核：
+
+- 先打印「本期免费游戏共 N 款待领取：…」，把"这一期要领几个"说清楚，不再含糊；
+- 未入库的自动补领，最多 3 轮，每轮之间等待并**重新**拉取订单历史；
+- 全部确认入库才打印 `🎉 全部 N 款免费游戏已确认入库：…`；
+- 3 轮后仍有缺漏才抛错，交给调度器（12:00 兜底 + 周四夜间多轮）继续重试。
+
+同时 `collect_epic_games()` 不再因为 UI 层的"未确认"就直接失败，而是转交订单历史复核决定。
+
+### 补丁 10：即时运行失败不再拖垮容器
+`app/deploy.py`
+
+**现象**：容器内跑完一次领取后进程退出、Docker 立刻重启，又触发一次即时运行；如果失败是
+持续性的（例如结算阶段 hCaptcha 解不开），就变成**崩溃-重启循环**，反复登录/领取，
+既浪费 Epic 的 24 小时限流额度，也给账号带来风控风险。
+
+**原因**：`deploy()` 先跑一次即时任务、再启动调度器；即时任务抛错时异常一路冒到
+`asyncio.run` 顶层，进程退出。而 compose 里配的是 `restart: unless-stopped`。
+
+**修法**：把即时运行包进 `try/except`，失败只记日志，**调度器照常启动**，
+由计划任务负责重试。
+
+### 附：领取回执核对工具
+`tools/claim_receipts.py`
+
+```
+docker exec epic-freebies-helper uv run tools/claim_receipts.py --hours 72
+```
+
+读取 Epic 的「Your Epic Games Receipt」邮件，列出最近 N 小时**实际入库**的游戏。
+回执邮件是"确实下单"的权威凭证，因此它被用作对账与通知的依据
+（每日 9:30 的邮件通知会附带这一段）。
+
 ### 重建镜像后如何让补丁生效
 ```
 docker compose up -d --build
 ```
 只有 `repo/` 内文件或 `Dockerfile` 变化时才会重新构建，其余情况走缓存，通常十几秒完成。
+
+**注意**：镜像构建要从 GitHub 下载 camoufox 内核（约 1.29 GB）和 GeoLite2 城市库。
+如果本机直连 GitHub 不通，构建会在下载步骤失败（日志里是 `Connection refused`）。
+此时给构建挂上本地代理即可（下面的端口换成你自己的）：
+
+```
+docker build \
+  --build-arg HTTP_PROXY=http://host.docker.internal:10080 \
+  --build-arg HTTPS_PROXY=http://host.docker.internal:10080 \
+  --build-arg NO_PROXY=localhost,127.0.0.1,::1 \
+  --add-host host.docker.internal:host-gateway \
+  -t epic-freebies-helper:local -f Dockerfile .
+
+docker compose up -d --no-build
+```
 
 ---
 

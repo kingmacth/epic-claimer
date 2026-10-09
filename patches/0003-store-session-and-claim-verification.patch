@@ -1,0 +1,477 @@
+diff --git a/app/deploy.py b/app/deploy.py
+index 1a1a0cb..4224c82 100644
+--- a/app/deploy.py
++++ b/app/deploy.py
+@@ -288,7 +288,19 @@ async def deploy():
+     )
+ 
+     # Execute an immediate collection task (single- or multi-account)
+-    await _run_accounts(headless=headless)
++    #
++    # 注意：这里必须吞掉异常。容器使用 restart: unless-stopped，一旦即时运行抛错，
++    # deploy() 就会把异常抛到 asyncio.run 顶层 → 进程退出 → Docker 立刻重启 →
++    # 又触发一次即时运行。若失败是持续性的（例如结算阶段 hCaptcha 解不开），
++    # 就会形成"崩溃-重启"循环，反复登录/领取，既消耗 Epic 24h 限流额度，
++    # 也会给账号带来风控风险。失败只记日志，让调度器照常启动。
++    try:
++        await _run_accounts(headless=headless)
++    except Exception as err:
++        logger.error(
++            "Immediate collection run failed; scheduler will still start and retry later | err={!r}",
++            err,
++        )
+ 
+     # Skip scheduler setup if disabled in configuration
+     if not settings.ENABLE_APSCHEDULER:
+diff --git a/app/services/epic_authorization_service.py b/app/services/epic_authorization_service.py
+index ea41356..150ce57 100644
+--- a/app/services/epic_authorization_service.py
++++ b/app/services/epic_authorization_service.py
+@@ -654,10 +654,29 @@ class EpicAuthorization:
+             logger.warning("Failed to verify Epic account session via order history: {!r}", err)
+             return False
+ 
++    async def _complete_store_sso_exchange(self) -> None:
++        """通过 /id/api/redirect 为 store.epicgames.com 种下会话 cookie。
++
++        登录只建立了账号级会话（www.epicgames.com）。store.epicgames.com 是独立域，
++        其会话必须靠 SSO 交换端点换取；否则 //egs-navigation 会一直显示
++        isloggedin="false"（或根本不渲染），采集阶段会报
++        "context cookies is not available" 并中断整个领取流程。
++        """
++        logger.warning("Completing store SSO exchange via /id/api/redirect to seed store cookies")
++        with suppress(Exception):
++            await self.page.goto(
++                "https://www.epicgames.com/id/api/redirect?redirectUrl="
++                + quote(URL_CLAIM, safe=""),
++                wait_until="domcontentloaded",
++                timeout=30000,
++            )
++        await self._goto_claim_page()
++
+     async def _ensure_store_session_ready(self, timeout_seconds: int = 45) -> None:
+         deadline = time.monotonic() + timeout_seconds
+         account_probe_at = time.monotonic() + 8
+         account_probe_attempted = False
++        sso_exchange_done = False
+         false_streak = 0
+ 
+         while time.monotonic() < deadline:
+@@ -682,22 +701,16 @@ class EpicAuthorization:
+                 # （/id/api/redirect）种 cookie，页面加载太早会读到 isloggedin=false。
+                 # 先走一次 SSO 交换，再刷新重读，而不是立刻判死。
+                 false_streak += 1
+-                if false_streak == 1:
++                if not sso_exchange_done:
++                    sso_exchange_done = True
+                     logger.warning(
+                         "Epic store reports isloggedin=false; completing SSO exchange "
+                         "via /id/api/redirect | current_url='{}'",
+                         self.page.url,
+                     )
+-                    with suppress(Exception):
+-                        await self.page.goto(
+-                            "https://www.epicgames.com/id/api/redirect?redirectUrl="
+-                            + quote(URL_CLAIM, safe=""),
+-                            wait_until="domcontentloaded",
+-                            timeout=30000,
+-                        )
+-                    await self._goto_claim_page()
++                    await self._complete_store_sso_exchange()
+                     continue
+-                if false_streak == 2:
++                if false_streak <= 3:
+                     with suppress(Exception):
+                         await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                     continue
+@@ -708,6 +721,18 @@ class EpicAuthorization:
+ 
+             if not account_probe_attempted and time.monotonic() >= account_probe_at:
+                 account_probe_attempted = True
++                if not sso_exchange_done:
++                    # //egs-navigation 迟迟没渲染（读到 None）时同样要补一次 SSO 交换：
++                    # 仅凭订单历史（账号域）探测通过就宣布「store 会话就绪」，会让 store 域
++                    # 的 cookie 从未种下，采集阶段直接报 context cookies 不可用。
++                    sso_exchange_done = True
++                    logger.warning(
++                        "Epic navigation login marker did not appear; attempting store SSO "
++                        "exchange before the order-history fallback | current_url='{}'",
++                        self.page.url,
++                    )
++                    await self._complete_store_sso_exchange()
++                    continue
+                 logger.warning(
+                     "Epic navigation login marker did not appear after authentication; "
+                     "probing account session via order history."
+diff --git a/app/services/epic_games_service.py b/app/services/epic_games_service.py
+index 736ea53..be1de75 100644
+--- a/app/services/epic_games_service.py
++++ b/app/services/epic_games_service.py
+@@ -11,6 +11,7 @@ import time
+ from contextlib import suppress
+ from json import JSONDecodeError
+ from typing import List
++from urllib.parse import quote
+ 
+ import httpx
+ from hcaptcha_challenger.agent import AgentV
+@@ -183,10 +184,29 @@ class EpicAgent:
+             )
+             return None
+ 
+-    async def _wait_for_claim_page_login_state(self, timeout_seconds: int = 45) -> str:
++    async def _complete_store_sso_exchange(self) -> None:
++        """通过 /id/api/redirect 为 store.epicgames.com 种下会话 cookie。
++
++        登录只建立了账号级会话（www.epicgames.com），store 域是独立域，其会话要靠
++        SSO 交换端点换取。跳过这一步时 //egs-navigation 会读到 isloggedin="false"，
++        进而误报 "context cookies is not available" 并中断整个领取流程。
++        """
++        logger.warning("Completing store SSO exchange via /id/api/redirect to seed store cookies")
++        with suppress(Exception):
++            await self.page.goto(
++                "https://www.epicgames.com/id/api/redirect?redirectUrl="
++                + quote(URL_CLAIM, safe=""),
++                wait_until="domcontentloaded",
++                timeout=30000,
++            )
++        await self._goto_claim_page()
++
++    async def _wait_for_claim_page_login_state(self, timeout_seconds: int = 90) -> str:
+         deadline = time.monotonic() + timeout_seconds
+         account_probe_at = time.monotonic() + 8
+         account_probe_attempted = False
++        sso_exchange_attempts = 0
++        last_status: str | None = None
+ 
+         while time.monotonic() < deadline:
+             if self._needs_privacy_policy_correction():
+@@ -198,8 +218,28 @@ class EpicAgent:
+                 raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
+ 
+             status = await self._get_login_status(timeout_ms=1500)
+-            if status in {"true", "false"}:
+-                return status
++            last_status = status
++
++            if status == "true":
++                return "true"
++
++            if status == "false":
++                # 页面水合前（或 store 会话尚未种下时）读到 isloggedin=false 是正常现象，
++                # 绝不能据此直接判死 —— 否则就是本次事故的
++                # "❌ context cookies is not available"。先补一次 store SSO 交换再重试。
++                if sso_exchange_attempts < 2:
++                    sso_exchange_attempts += 1
++                    logger.warning(
++                        "Epic claim page reports isloggedin=false; completing store SSO "
++                        "exchange and retrying ({}/2) | current_url='{}'",
++                        sso_exchange_attempts,
++                        self.page.url,
++                    )
++                    await self._complete_store_sso_exchange()
++                    await self.page.wait_for_timeout(2000)
++                    continue
++                logger.error("❌ context cookies is not available")
++                return "false"
+ 
+             if not account_probe_attempted and time.monotonic() >= account_probe_at:
+                 account_probe_attempted = True
+@@ -207,6 +247,17 @@ class EpicAgent:
+                     "Epic navigation login marker did not appear; probing account session via order history."
+                 )
+                 if await self._has_account_session():
++                    if sso_exchange_attempts < 2:
++                        # 账号级会话可用 ≠ store 会话就绪，补一次 SSO 交换后重新确认。
++                        sso_exchange_attempts += 1
++                        logger.warning(
++                            "Account session is valid; completing store SSO exchange to seed "
++                            "store cookies ({}/2)",
++                            sso_exchange_attempts,
++                        )
++                        await self._complete_store_sso_exchange()
++                        await self.page.wait_for_timeout(2000)
++                        continue
+                     return "true"
+                 await self._goto_claim_page()
+ 
+@@ -215,6 +266,10 @@ class EpicAgent:
+         if self._needs_mfa_setup_prompt():
+             raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
+ 
++        if last_status == "false":
++            logger.error("❌ context cookies is not available")
++            return "false"
++
+         if await self._has_account_session():
+             return "true"
+ 
+@@ -338,6 +393,62 @@ class EpicAgent:
+             return True
+         return False
+ 
++    async def _verify_weekly_claims(
++        self, promotions: List[PromotionGame], *, max_attempts: int = 3
++    ) -> None:
++        """以 Epic 订单历史（服务端）为唯一权威依据，复核本期免费游戏是否全部入库。
++
++        上游以页面 UI 标记判定是否领取成功（例如购买按钮出现 'IN LIBRARY'），但在结算
++        iframe 没有正常收尾时该标记会误报成功——曾出现"日志显示已领取、实际上没有订单"
++        的情况。因此这里不再相信 UI 结论，直接查订单历史（与"此前已拥有"判定同一数据源）：
++        对仍未入库的游戏补领，全部确认后才算完成，否则抛出明确错误交由调度器下轮重试。
++        """
++        if not promotions:
++            return
++
++        names = ", ".join(p.title for p in promotions)
++        logger.info("本期免费游戏共 {} 款待领取：{}", len(promotions), names)
++
++        missing: List[PromotionGame] = list(promotions)
++        for attempt in range(1, max_attempts + 1):
++            # 订单历史有写入延迟，逐轮拉长等待
++            await self.page.wait_for_timeout(5000 * attempt)
++            try:
++                namespaces = await self.refresh_order_namespaces()
++            except Exception as err:
++                logger.warning(
++                    "订单历史复核失败（第 {}/{} 次），稍后重试 | err={!r}",
++                    attempt,
++                    max_attempts,
++                    err,
++                )
++                continue
++
++            missing = [p for p in promotions if p.namespace not in namespaces]
++            if not missing:
++                logger.success(
++                    "🎉 全部 {} 款免费游戏已确认入库：{}", len(promotions), names
++                )
++                return
++
++            logger.warning(
++                "订单历史复核：仍有 {} 款未入库（第 {}/{} 次）：{}",
++                len(missing),
++                attempt,
++                max_attempts,
++                ", ".join(p.title for p in missing),
++            )
++            if attempt < max_attempts:
++                try:
++                    await self.epic_games.collect_weekly_games(missing)
++                except Exception as err:
++                    logger.warning("补领未入库游戏失败，稍后重试 | err={!r}", err)
++
++        raise RuntimeError(
++            "以下免费游戏在订单历史中仍未确认入库："
++            + ", ".join(f"{p.title} ({p.url})" for p in missing)
++        )
++
+     async def collect_epic_games(self):
+         if await self._should_ignore_task():
+             logger.success("All week-free games are already in the library")
+@@ -357,12 +468,16 @@ class EpicAgent:
+             pj = json.dumps({"title": p.title, "url": p.url}, indent=2, ensure_ascii=False)
+             logger.debug(f"Discover promotion \n{pj}")
+ 
+-        if self._promotions:
+-            try:
+-                await self.epic_games.collect_weekly_games(self._promotions)
+-            except Exception as e:
+-                logger.exception(e)
+-                raise
++        try:
++            await self.epic_games.collect_weekly_games(self._promotions)
++        except Exception as e:
++            # 不再因为 UI 层的"未确认"直接失败：以订单历史复核为准，
++            # 由 _verify_weekly_claims 决定补领或报错。
++            logger.warning(
++                "领取流程报告未确认，改为按订单历史复核 | err={!r}", e
++            )
++
++        await self._verify_weekly_claims(self._promotions)
+ 
+         logger.debug("All tasks in the workflow have been completed")
+ 
+diff --git a/tools/claim_receipts.py b/tools/claim_receipts.py
+new file mode 100644
+index 0000000..451a20f
+--- /dev/null
++++ b/tools/claim_receipts.py
+@@ -0,0 +1,177 @@
++# -*- coding: utf-8 -*-
++"""读取 Epic 领取回执邮件，列出最近实际入库的游戏。
++
++用途：Epic 的"页面 UI 标记"判定会误报（结算 iframe 未收尾时会显示 IN LIBRARY，
++但实际没有订单）。**回执邮件是"确实入库"的权威凭证**，因此用它做最终核对与通知。
++
++在容器内运行：
++    docker exec epic-freebies-helper uv run tools/claim_receipts.py --hours 72
++"""
++from __future__ import annotations
++
++import argparse
++import email
++import imaplib
++import os
++import re
++import ssl
++import sys
++from datetime import datetime, timedelta, timezone
++from email.header import decode_header, make_header
++from email.utils import parsedate_to_datetime
++
++IMAP_SEND_ID = '("name" "epic-claimer" "version" "1.0" "vendor" "workbuddy")'
++LABELS = {
++    "description:",
++    "publisher:",
++    "price:",
++    "discounts:",
++    "sale discount",
++    "quantity:",
++    "item:",
++}
++PRICE_RE = re.compile(r"^-?\s*\$[\d.,]+\s*(usd|us\$)?$", re.I)
++
++
++def dec(value) -> str:
++    if not value:
++        return ""
++    try:
++        return str(make_header(decode_header(value)))
++    except Exception:
++        return str(value)
++
++
++def html_to_lines(html: str) -> list[str]:
++    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
++    html = re.sub(r"<br\s*/?>|</(p|div|tr|td|h\d)>", "\n", html, flags=re.I)
++    html = re.sub(r"<[^>]+>", " ", html)
++    html = (
++        html.replace("&nbsp;", " ")
++        .replace("&amp;", "&")
++        .replace("&#39;", "'")
++        .replace("&quot;", '"')
++    )
++    return [ln.strip() for ln in html.splitlines() if ln.strip()]
++
++
++def extract_titles(msg: email.message.Message) -> list[str]:
++    body_lines: list[str] = []
++    for part in msg.walk():
++        if part.get_content_type() != "text/html":
++            continue
++        payload = part.get_payload(decode=True)
++        if not payload:
++            continue
++        lines = html_to_lines(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
++        if len(lines) > len(body_lines):
++            body_lines = lines
++
++    if not body_lines:
++        return []
++
++    try:
++        start = next(
++            i for i, ln in enumerate(body_lines) if "WHAT YOU ORDERED" in ln.upper()
++        )
++    except StopIteration:
++        return []
++
++    titles: list[str] = []
++    seen_label = False
++    for ln in body_lines[start + 1 : start + 40]:
++        upper = ln.upper()
++        if upper.startswith("TOTAL") or "KEEP A COPY" in upper:
++            break
++        if ln.lower() in LABELS:
++            seen_label = True
++            continue
++        if PRICE_RE.match(ln) or ln.lower().startswith(("order id", "invoice")):
++            continue
++        # 表格被压平后顺序是：Description/Publisher/Price 表头 → 标题 → 发行商 → 价格
++        if seen_label:
++            titles.append(ln)
++            break
++    return titles
++
++
++def connect():
++    host = os.environ.get("EPIC_IMAP_HOST", "imap.163.com")
++    port = int(os.environ.get("EPIC_IMAP_PORT", "143") or 143)
++    user = os.environ.get("EPIC_IMAP_USER", "")
++    pwd = os.environ.get("EPIC_IMAP_PASS", "")
++    folder = os.environ.get("EPIC_IMAP_FOLDER", "INBOX") or "INBOX"
++    if not user or not pwd:
++        raise SystemExit("[error] 未配置 EPIC_IMAP_USER / EPIC_IMAP_PASS")
++
++    if port == 993:
++        conn = imaplib.IMAP4_SSL(host, port, timeout=40)
++    else:
++        conn = imaplib.IMAP4(host, port, timeout=40)
++        conn.starttls(ssl_context=ssl.create_default_context())
++
++    conn.login(user, pwd)
++    # 163 要求登录后立刻发 ID，否则 SELECT 返回 "EXAMINE Unsafe Login"
++    if not hasattr(imaplib, "Commands"):
++        imaplib.Commands = {}
++    if "ID" not in imaplib.Commands:
++        imaplib.Commands["ID"] = ("AUTH", "SELECTED")
++    try:
++        typ, dat = conn._simple_command("ID", IMAP_SEND_ID)
++        conn._untagged_response(typ, dat, "ID")
++    except Exception:
++        pass
++
++    conn.select(folder, readonly=True)
++    return conn
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--hours", type=int, default=72, help="只看最近多少小时的回执")
++    args = ap.parse_args()
++
++    since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
++    conn = connect()
++
++    typ, data = conn.uid("SEARCH", None, "SINCE", since.strftime("%d-%b-%Y"))
++    uids = data[0].split() if typ == "OK" and data and data[0] else []
++
++    rows: list[tuple[str, str, str]] = []
++    for uid in uids:
++        typ, fetched = conn.uid("FETCH", uid, "(RFC822)")
++        raw = next((it[1] for it in fetched if isinstance(it, tuple) and len(it) > 1), b"")
++        if not raw:
++            continue
++        msg = email.message_from_bytes(raw)
++        subject = dec(msg.get("Subject"))
++        if "receipt" not in subject.lower():
++            continue
++        try:
++            dt = parsedate_to_datetime(msg.get("Date"))
++            if dt.tzinfo is None:
++                dt = dt.replace(tzinfo=timezone.utc)
++        except Exception:
++            dt = since
++        if dt < since:
++            continue
++        local = dt.astimezone().strftime("%Y-%m-%d %H:%M")
++        titles = extract_titles(msg)
++        body = " / ".join(titles) if titles else "(未能解析，请人工查看)"
++        rows.append((local, body, subject))
++
++    conn.logout()
++
++    print(f"Epic 领取回执（最近 {args.hours} 小时，本地时间）")
++    if not rows:
++        print("  （无）")
++        print("合计 0 款")
++        return 0
++    for local, body, _subject in sorted(rows):
++        print(f"  {local} | {body}")
++    print(f"合计 {len(rows)} 笔回执")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
