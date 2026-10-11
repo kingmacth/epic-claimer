@@ -24,7 +24,7 @@ index 1a1a0cb..4224c82 100644
      # Skip scheduler setup if disabled in configuration
      if not settings.ENABLE_APSCHEDULER:
 diff --git a/app/services/epic_authorization_service.py b/app/services/epic_authorization_service.py
-index ea41356..150ce57 100644
+index ea41356..42d8a94 100644
 --- a/app/services/epic_authorization_service.py
 +++ b/app/services/epic_authorization_service.py
 @@ -654,10 +654,29 @@ class EpicAuthorization:
@@ -103,6 +103,19 @@ index ea41356..150ce57 100644
                  logger.warning(
                      "Epic navigation login marker did not appear after authentication; "
                      "probing account session via order history."
+@@ -777,7 +802,11 @@ class EpicAuthorization:
+                     pass
+ 
+                 try:
+-                    await self._await_login_outcome(point_url, agent, timeout_seconds=25)
++                    # 邮箱验证码 2FA：IMAP 取码 + 提交普遍需要 30-60 秒，Epic 显示
++                    # MFA 页也可能慢几秒。25 秒窗口会在「挑战已解对」时白白超时
++                    # （2026-10-11 实测：挑战 success 后 27 秒即报 outcome 超时）。
++                    # 放宽到 90 秒；内部 extend_deadline 的硬顶（180 秒）不变。
++                    await self._await_login_outcome(point_url, agent, timeout_seconds=90)
+                     login_confirmed = True
+                     break
+                 except PlaywrightTimeoutError:
 diff --git a/app/services/epic_games_service.py b/app/services/epic_games_service.py
 index 736ea53..be1de75 100644
 --- a/app/services/epic_games_service.py

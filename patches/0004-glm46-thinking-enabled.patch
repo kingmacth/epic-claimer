@@ -1,0 +1,31 @@
+diff --git a/app/extensions/llm_adapter.py b/app/extensions/llm_adapter.py
+index 397c6ef..d610931 100644
+--- a/app/extensions/llm_adapter.py
++++ b/app/extensions/llm_adapter.py
+@@ -91,11 +91,24 @@ GLM_MULTI_TARGET_INSTRUCTION = (
+ 
+ 
+ def _glm_thinking_payload(model: str, config: Any) -> dict[str, str] | None:
+-    """Keep GLM point-selection calls within hCaptcha response budgets."""
+-    if not model.lower().startswith("glm-4.5"):
++    """Keep GLM point-selection calls within hCaptcha response budgets.
++
++    glm-4.6v must keep thinking ENABLED for spatial point answers. Measured on a
++    saved challenge (2026-10-11): thinking-disabled replies were fast (2-5s) but
++    0/3 samples produced even one in-bounds point - the model answered in raw
++    image pixel space and ignored the labelled page-coordinate axes - while
++    thinking-enabled replies were 3/3 in-bounds (18-52s each). The speed cost is
++    absorbed by raising GLM_REQUEST_TIMEOUT_SECONDS / EXECUTION_TIMEOUT instead.
++    """
++    name = model.lower()
++    if not (name.startswith("glm-4.5") or name.startswith("glm-4.6")):
+         return None
+     if getattr(config, "thinking_config", None) is None:
+         return None
++    if name.startswith("glm-4.6"):
++        # Verified: disabling thinking breaks glm-4.6v spatial accuracy, so the
++        # upstream 4.5 shortcut (points -> disabled) must NOT apply here.
++        return {"type": "enabled"}
+     if "points" in _schema_field_names(getattr(config, "response_schema", None)):
+         return {"type": "disabled"}
+     return {"type": "enabled"}

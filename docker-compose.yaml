@@ -28,6 +28,12 @@ services:
 
     environment:
       - TZ=Asia/Shanghai
+      # hCaptcha 求解靠 GLM-4.6V 视觉模型，思考模式下单次请求 18-52 秒。
+      # 默认 50 秒会被尾延迟打断（ReadTimeout），放宽到 90 秒（上限 120）。
+      - GLM_REQUEST_TIMEOUT_SECONDS=90
+      # 单个挑战要 2 轮点选，每轮最多 2 次模型调用；默认 120 秒会被
+      # "Challenge execution timed out" 打断（2026-10-10 五连败的根因），放宽到 240。
+      - EXECUTION_TIMEOUT=240
 
     volumes:
       # 日志、截图、浏览器 profile 落在这里，宿主机可直接读取

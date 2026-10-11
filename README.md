@@ -425,6 +425,44 @@ docker exec epic-freebies-helper uv run tools/claim_receipts.py --hours 72
 回执邮件是"确实下单"的权威凭证，因此它被用作对账与通知的依据
 （每日 9:30 的邮件通知会附带这一段）。
 
+### 补丁 11：glm-4.6v 空间点选必须保留思考模式
+`app/extensions/llm_adapter.py`（`patches/0004-glm46-thinking-enabled.patch`）
+
+**现象**：2026-10-10 起登录连续失败，日志里既有
+`GLM request timed out after 50 seconds (ReadTimeout)`，也有
+`Rejected unsafe hCaptcha point answer ... outside challenge bounds`。
+
+**排查**：把一道保存下来的点选题（challenge_view + 带页面坐标轴的 grid 投影图）
+离线喂给 `glm-4.6v` 做 A/B：
+
+| thinking | 单次耗时 | 坐标越界情况 |
+|---|---|---|
+| disabled | 2–5 秒 | **3 次全部 0 个有效点**（模型改用图像内部像素坐标，完全无视坐标轴标注的页面坐标） |
+| enabled | 18–52 秒 | 3 次全部有效（与历史成功样本一致） |
+
+结论：上游 `_glm_thinking_payload()` 只对 `glm-4.5*` 生效，`glm-4.6v` 落到"不传
+thinking 字段"分支（服务端默认开思考、慢但准）；如果仿照 4.5 的"点选关思考"捷径，
+速度飞快但精度归零。**空间点选类调用必须显式 `{"type": "enabled"}`**。
+
+**修法**：
+1. 对 `glm-4.6*` 显式返回 `{"type": "enabled"}`（4.5 的行为保持不变）；
+2. 速度问题改由时间预算吸收：`GLM_REQUEST_TIMEOUT_SECONDS=90`（默认 50 会被
+   尾延迟打断）、`EXECUTION_TIMEOUT=240`（默认 120 撑不住"2 轮 × 最多 2 次调用
+   + 重试"，见 docker-compose.yaml 的 environment 段）。
+
+### 补丁 12：挑战解对后的登录确认窗口放宽
+`app/services/epic_authorization_service.py`（并入 `patches/0003-...patch`）
+
+**现象**：hCaptcha 挑战明明返回 `signal=success`，27 秒后仍然报
+`Timed out waiting for Epic login outcome`，整个登录尝试作废。
+
+**原因**：挑战解对后，`_await_login_outcome` 只拿到 `timeout_seconds=25` 的确认
+窗口。本方案的 2FA 是**邮箱验证码**（IMAP 取码 + 填入 + 提交普遍要 30–60 秒），
+Epic 显示 MFA 页本身也可能慢几秒——25 秒根本不够走完。
+
+**修法**：确认窗口 25 秒 → 90 秒。函数内部 `extend_deadline` 的硬顶
+（`max(timeout_seconds, 180)` = 180 秒）不变，纯放宽首次等待，无额外风险。
+
 ### 重建镜像后如何让补丁生效
 ```
 docker compose up -d --build
